@@ -1,0 +1,710 @@
+"""
+基于离港时间的泊位-岸桥调度贪婪启发式算法 Demo
+=================================================
+本文件给出了一个可直接运行的 Python 示例，使用 Data_ThreeDay_0.xlsx 中的数据，
+按照 BandP Algorithm.pdf 中的混合整数规划模型（MIPM-Ⅱ）所需的 16 个决策变量
+进行显式构造，并输出可读的调度方案。现增加 Dantzig-Wolfe 线性化中的
+α_vbt、β_vbt、χ_vqjt、ψ_vqjt 四个 0-1 决策变量，便于与 2.4 节的模型
+保持一致。
+
+实现要点：
+1. 数据读取和预处理与描述一致；
+2. 以“预计离港时间”升序作为贪婪顺序，确保尽可能早离港的船舶先被排程；
+3. 兼顾约束：
+   - 任务 j2 必须先于同船舶的 j3；
+   - JE（j1）任务在同一泊位上不能与其它任务同时刻执行；
+   - 需要岸桥的任务集合 JQ，泊位可执行任务集 B_j，泊位间移泊时间 tc_v；
+   - 其它约束使用时间离散化（10 分钟）和占用表显式保证；
+4. 目标函数近似 MIPM-Ⅱ 的分量：(5) 偏离/速率提升/移泊/延迟成本，使用
+   alpha1~alpha4 加权；
+5. 显式输出 16 个决策变量（X_vbj、Y_vqj、TS_vj、TE_vj、TE_v、S_vb、E_vb、
+   SB_vbt、SBJ_vbjt、SQJ_vqjt、G_vj、O_vbb'、Z_vb、φ_vbj、γ_vqj、D_v），并补充
+   4 个线性化变量（α_vbt、β_vbt、χ_vqjt、ψ_vqjt）。
+
+使用方法：
+    python greedy_departure_heuristic.py
+
+运行后会打印：
+- 目标值及分量；
+- 每艘船舶的决策变量取值及调度结果；
+- 泊位视角和岸桥视角的时间表。
+
+伪代码（中文）：
+--------------------------------------------
+1 读入 Excel 数据，构造集合 V、B、Q、J_all、JR_v、B_j、基线计划等；
+2 将船舶按预计离港时间升序排序，形成列表 V_sorted；
+3 初始化所有决策变量的存储结构，泊位/岸桥时间占用表 occupancy；
+4 对于 V_sorted 中的每艘船舶 v：
+   4.1 取其任务集合 JR_v[v]，按照规则排序（j2 在 j3 之前，其余按任务编号）；
+   4.2 对于任务 j：
+       a) 根据基线优先选择泊位 b ∈ B_j[j]，否则选择能最早开工的泊位；
+       b) 若 j ∈ JQ，按照基线优先分配岸桥 q ∈ Q；
+       c) 计算作业速率 G_vj，初始用基线 v_j[j]，若会造成延迟则在 vup_j[j]
+          范围内尝试提升；
+       d) 依据占用表找到满足：
+          - 泊位属性允许；
+          - JE 互斥（若 j1 或已有 j1 任务冲突则顺延）；
+          - 同船舶上一个任务的结束 + tc_v（若换泊位）之后；
+          - 岸桥可用（对 JQ 任务）；
+          的最早离散时刻 TS_vj，并计算 TE_vj；
+       e) 更新占用表，记录 SB_vbt、SBJ_vbjt、SQJ_vqjt；
+       f) 设置 X_vbj、Y_vqj、φ_vbj、γ_vqj、Z_vb、S_vb、E_vb、O_vbb'；
+   4.3 得到 TE_v = max_j TE_vj，并计算延迟 D_v = max(0, TE_v - t_v_d[v])；
+5 统计成本分量 F1~F4 与加权目标值；
+6 按指定格式打印结果。
+--------------------------------------------
+"""
+
+import math
+import zipfile
+import xml.etree.ElementTree as ET
+from collections import defaultdict
+
+
+def _col_letter_to_index(col_letter: str) -> int:
+    """将 Excel 列字母转换为从 0 开始的列序号。"""
+    result = 0
+    for ch in col_letter:
+        result = result * 26 + (ord(ch.upper()) - ord('A') + 1)
+    return result - 1
+
+
+def load_xlsx_table(file_path: str, sheet_name: str):
+    """
+    纯标准库读取 xlsx：解析 sharedStrings 与 workbook 关系，返回表格行的字典列表。
+    仅依赖于 xml.etree 与 zipfile，可在无法联网安装依赖的环境中运行。
+    """
+    with zipfile.ZipFile(file_path, 'r') as zf:
+        # 解析共享字符串
+        shared_strings = []
+        with zf.open('xl/sharedStrings.xml') as ss_file:
+            ss_root = ET.parse(ss_file).getroot()
+            for si in ss_root.findall('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}si'):
+                text_elems = si.findall('.//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t')
+                text_val = ''.join([t.text or '' for t in text_elems])
+                shared_strings.append(text_val)
+
+        # workbook 中找到目标 sheet 与 rId
+        with zf.open('xl/workbook.xml') as wb_file:
+            wb_root = ET.parse(wb_file).getroot()
+            ns = {'ns': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+            target_rid = None
+            for sheet in wb_root.findall('ns:sheets/ns:sheet', ns):
+                if sheet.attrib.get('name') == sheet_name:
+                    target_rid = sheet.attrib.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
+                    break
+            if not target_rid:
+                raise ValueError(f"未找到名称为 {sheet_name} 的工作表")
+
+        # 根据 rId 找到对应的 sheetX.xml
+        with zf.open('xl/_rels/workbook.xml.rels') as rel_file:
+            rel_root = ET.parse(rel_file).getroot()
+            ns_rel = {'rel': 'http://schemas.openxmlformats.org/package/2006/relationships'}
+            target_path = None
+            for rel in rel_root.findall('rel:Relationship', ns_rel):
+                if rel.attrib.get('Id') == target_rid:
+                    target_path = rel.attrib.get('Target')
+                    break
+            if not target_path:
+                raise ValueError('未找到目标工作表路径')
+
+        # 读取 sheet 数据
+        with zf.open(f"xl/{target_path}") as sheet_file:
+            sheet_root = ET.parse(sheet_file).getroot()
+            ns_sheet = {'ns': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+            rows = []
+            header = []
+            for row in sheet_root.findall('ns:sheetData/ns:row', ns_sheet):
+                cells = {}
+                for c in row.findall('ns:c', ns_sheet):
+                    cell_ref = c.attrib.get('r')
+                    col_letters = ''.join([ch for ch in cell_ref if ch.isalpha()])
+                    col_idx = _col_letter_to_index(col_letters)
+                    cell_type = c.attrib.get('t')
+                    v_elem = c.find('ns:v', ns_sheet)
+                    if v_elem is None:
+                        cell_value = ''
+                    else:
+                        raw_text = v_elem.text or ''
+                        if cell_type == 's':
+                            cell_value = shared_strings[int(raw_text)]
+                        else:
+                            try:
+                                cell_value = float(raw_text)
+                            except ValueError:
+                                cell_value = raw_text
+                    cells[col_idx] = cell_value
+
+                # 将当前行转换为列表（按列索引填补缺失）
+                max_col = max(cells.keys()) if cells else -1
+                row_values = [cells.get(i, '') for i in range(max_col + 1)]
+                rows.append(row_values)
+
+            if not rows:
+                return []
+
+            header = rows[0]
+            data_rows = rows[1:]
+            table = []
+            for r in data_rows:
+                record = {}
+                for idx, h in enumerate(header):
+                    if h == '':
+                        continue
+                    record[h] = r[idx] if idx < len(r) else ''
+                table.append(record)
+            return table
+
+# =============================================================================
+# 1. 数据读取和预处理（完全对应需求中给出的配置）
+# =============================================================================
+
+print("正在读取数据并初始化参数...")
+file_path = "D:\Data_ThreeDay_0.xlsx"
+table_rows_raw = load_xlsx_table(file_path, sheet_name="Three Day")
+# 过滤掉空行，确保包含船舶编号
+table_rows = [row for row in table_rows_raw if str(row.get('Vessel No.', '')).strip() != '']
+
+# 泊位属性配置：泊位 -> 可执行任务集合
+berths = {
+    'b1': ['j1'],
+    'b2': ['j1'],
+    'b3': ['j2', 'j3', 'j5'],
+    'b4': ['j2', 'j3', 'j5', 'j6', 'j7'],
+    'b5': ['j2', 'j3', 'j5', 'j6', 'j7'],
+    'b6': ['j2', 'j3', 'j5', 'j6', 'j7'],
+    'b7': ['j2', 'j3', 'j5', 'j6', 'j7'],
+    'b8': ['j2', 'j3', 'j4'],
+    'b9': ['j2', 'j3', 'j4'],
+}
+
+# 需要岸桥作业的任务集合与互斥集合
+JQ = ['j2', 'j3']
+JE = ['j1']
+
+# 任务优先级关系 p_jj'：仅 j3 需在 j2 之后
+p_jj_prime = {('j2', 'j3'): 1}
+
+# 岸桥集合
+Q = ['q1', 'q2', 'q3']
+
+# 移泊时间（小时）
+tc_v = 0.5
+
+# 基线作业速率与上限
+v_j = {'j1': 100, 'j2': 20, 'j3': 20, 'j4': 70, 'j5': 45, 'j6': 150, 'j7': 100}
+vup_j = {'j1': 150, 'j2': 40, 'j3': 40, 'j4': 160, 'j5': 90, 'j6': 200, 'j7': 150}
+
+# 大 M 值
+t_ld = 1 / 6  # 10 分钟
+M = 10000
+
+# 时间参数（为保证可行性，规划终点取较长窗口）
+t_s = 8
+t_l = 48
+t_xx = int((t_l - t_s) / t_ld)
+T_set = list(range(t_xx + 1))
+
+# 成本参数
+c_b = 1000
+c_q = 1000
+c_j = 1000
+c_d = 10000
+c_s = 10000
+
+# 目标权重
+alpha1 = 0.4
+alpha2 = 0.2
+alpha3 = 0.2
+alpha4 = 0.2
+
+# 船舶集合、任务映射
+V = [f"v{int(float(row['Vessel No.']))}" for row in table_rows]
+J_all = ['j1', 'j2', 'j3', 'j4', 'j5', 'j6', 'j7']
+task_mapping = {
+    'Refueling': 'j1',
+    'Unloading': 'j2',
+    'Loading': 'j3',
+    'Charging': 'j4',
+    'Water-filling': 'j5',
+    'Adding ash': 'j6',
+    'Adding mud': 'j7',
+}
+
+# 每艘船的任务集合 JR_v
+t_v_d = {}
+JR_v = {}
+for row in table_rows:
+    vessel = f"v{int(float(row['Vessel No.']))}"
+    t_v_d[vessel] = float(row['Expected departure time'])
+    JR_v[vessel] = []
+    for task_name, task_id in task_mapping.items():
+        n_col = f"{task_name}_n_vj"
+        n_val = row.get(n_col, '')
+        if n_val not in (None, '') and float(n_val) > 0:
+            JR_v[vessel].append(task_id)
+
+# 泊位-任务兼容 B_j
+B = list(berths.keys())
+B_j = {j: [b for b in B if j in berths[b]] for j in J_all}
+
+# 基线计划与作业量
+x_vbj_baseline = {}
+y_vqj_baseline = {}
+n_vj = {}
+for row in table_rows:
+    vessel = f"v{int(float(row['Vessel No.']))}"
+    for task_name, task_id in task_mapping.items():
+        n_col = f"{task_name}_n_vj"
+        x_col = f"{task_name}_x_vbj"
+        y_col = f"{task_name}_y_vqj"
+        n_val = row.get(n_col, '')
+        x_val = row.get(x_col, '')
+        y_val = row.get(y_col, '')
+        if n_val not in (None, '') and float(n_val) > 0:
+            n_vj[(vessel, task_id)] = float(n_val)
+            if x_val not in (None, ''):
+                x_vbj_baseline[(vessel, task_id)] = f"b{int(x_val)}"
+            if task_id in JQ and y_val not in (None, ''):
+                y_vqj_baseline[(vessel, task_id)] = f"q{int(y_val)}"
+
+# =============================================================================
+# 2. 决策变量的数据结构（16 个，不可缺少）
+# =============================================================================
+
+# 0-1 分配变量
+X_vbj = defaultdict(int)  # 船舶 v 任务 j 分配泊位 b
+Y_vqj = defaultdict(int)  # 船舶 v 任务 j 分配岸桥 q
+
+# 时间相关变量
+TS_vj = {}  # 开始时间
+TE_vj = {}  # 结束时间
+TE_v = {}   # 船舶完成时间
+S_vb = defaultdict(lambda: M)  # 在泊位 b 的最早时刻
+E_vb = defaultdict(lambda: -M)  # 在泊位 b 的最晚时刻
+
+# 时刻占用 0-1 变量
+SB_vbt = defaultdict(int)   # 时刻 t 泊位 b 服务 v
+SBJ_vbjt = defaultdict(int) # 时刻 t 泊位 b 服务 v 的任务 j
+SQJ_vqjt = defaultdict(int) # 时刻 t 岸桥 q 服务 v 的任务 j
+
+# 连续或速率变量
+G_vj = {}   # 任务执行速率
+
+# 顺序与使用变量
+O_vbb_prime = defaultdict(int)  # 在 b' 前在 b 执行
+Z_vb = defaultdict(int)         # 是否使用泊位 b
+
+# 线性化偏离与延迟变量
+phi_vbj = defaultdict(int)  # 泊位偏离
+gamma_vqj = defaultdict(int)  # 岸桥偏离
+D_v = {}  # 延迟时间
+
+# Dantzig-Wolfe 分解相关的线性化 0-1 决策变量（约束 130~140）
+alpha_vbt = defaultdict(int)  # α_vbt：泊位 b 在时刻 t 开始为船舶 v 服务
+beta_vbt = defaultdict(int)   # β_vbt：泊位 b 在时刻 t 结束为船舶 v 服务
+chi_vqjt = defaultdict(int)   # χ_vqjt：岸桥 q 在时刻 t 开始为船舶 v 的任务 j 服务
+psi_vqjt = defaultdict(int)   # ψ_vqjt：岸桥 q 在时刻 t 结束为船舶 v 的任务 j 服务
+
+# =============================================================================
+# 3. 辅助函数：检查占用并寻找最早可行开始时间
+# =============================================================================
+
+def is_conflict_with_JE(task_j: str, b: str, ts: float, te: float, berth_plan):
+    """检查 JE 互斥：如果 j1 或同泊位已有 j1 任务时间重叠，则冲突。"""
+    if task_j not in JE:
+        # 只有 j1 触发互斥
+        return False
+    for item in berth_plan[b]:
+        _, _, j_exist, ts_e, te_e = item
+        if j_exist in JE:
+            # 时间重叠则冲突
+            if not (te <= ts_e or ts >= te_e):
+                return True
+    return False
+
+
+def find_earliest_slot(v, j, duration, preferred_b, berth_plan, quay_plan, precedence_ready, current_berth, visit_start_time, visit_end_time):
+    """在所有可行泊位中找到最早的开工时间与对应泊位、岸桥。"""
+    best_tuple = None  # (te, ts, b, q)
+    tasks_need_quay = j in JQ
+
+    # 按基线优先，再按泊位编号排序
+    candidate_berths = B_j[j]
+    if preferred_b and preferred_b in candidate_berths:
+        ordered_berths = [preferred_b] + [b for b in candidate_berths if b != preferred_b]
+    else:
+        ordered_berths = candidate_berths
+
+    for b in ordered_berths:
+        # 需要岸桥时处理岸桥选择（基线优先）
+        candidate_quays = [None]
+        if tasks_need_quay:
+            q_pref = y_vqj_baseline.get((v, j))
+            candidate_quays = [q_pref] + [q for q in Q if q != q_pref] if q_pref else Q
+        else:
+            candidate_quays = [None]
+
+        for q in candidate_quays:
+            # 计算最早可用开始时间：同泊位可并行，不同泊位需考虑移泊
+            if current_berth is None:
+                start_time = max(precedence_ready, t_s)
+            elif current_berth == b:
+                # 仍在同一泊位，可与已有任务并行
+                base_ready = visit_start_time if visit_start_time is not None else t_s
+                start_time = max(precedence_ready, base_ready)
+            else:
+                # 不同泊位：等待当前泊位完成并加上移泊时间
+                base_ready = visit_end_time if visit_end_time is not None else t_s
+                start_time = max(precedence_ready, base_ready + tc_v)
+
+            # 离散化到时间网格
+            start_index = max(0, math.floor((start_time - t_s) / t_ld))
+            if start_time < t_s:
+                start_index = 0
+
+            # 扫描时间网格寻找可行窗口
+            ts_candidate = None
+            for t_idx in range(start_index, len(T_set)):
+                ts_value = t_s + t_idx * t_ld
+                te_value = ts_value + duration
+
+                # 超出计划窗口则跳出
+                if te_value > t_l:
+                    break
+
+                # JE 互斥检查
+                if is_conflict_with_JE(j, b, ts_value, te_value, berth_plan):
+                    continue
+
+                # 同泊位时间冲突：泊位独占约束 (35) 要求同一时刻仅服务一条船，
+                # 若涉及 JE（j1）则任何重叠都不允许；其余情况下只要与其他船舶
+                # 的占用重叠则禁止。
+                overlap = False
+                for v_exist, _, j_exist, ts_e, te_e in berth_plan[b]:
+                    if not (te_value <= ts_e or ts_value >= te_e):
+                        # 不同船舶：泊位独占，直接冲突
+                        if v_exist != v:
+                            overlap = True
+                            break
+                        # 同船舶：若任一任务属于 JE，则也不能重叠
+                        if j in JE or j_exist in JE:
+                            overlap = True
+                            break
+                if overlap:
+                    continue
+
+                # 岸桥冲突
+                if tasks_need_quay and q:
+                    for _, _, _, ts_e, te_e in quay_plan[q]:
+                        if not (te_value <= ts_e or ts_value >= te_e):
+                            overlap = True
+                            break
+                    if overlap:
+                        continue
+
+                # 符合所有条件
+                ts_candidate = ts_value
+                break
+
+            if ts_candidate is None:
+                continue
+
+            te_candidate = ts_candidate + duration
+            if best_tuple is None or te_candidate < best_tuple[0]:
+                best_tuple = (te_candidate, ts_candidate, b, q)
+
+    return best_tuple
+
+
+# =============================================================================
+# 4. 主启发式流程
+# =============================================================================
+
+# 泊位与岸桥的占用记录：列表元素 (v, task_order, j, ts, te)
+berth_plan = defaultdict(list)
+quay_plan = defaultdict(list)
+
+# 船舶按预计离港时间排序
+V_sorted = sorted(V, key=lambda vv: t_v_d[vv])
+
+# 记录移泊次数以计算 O_vbb' 与成本
+move_records = defaultdict(list)
+
+for v in V_sorted:
+    tasks_remaining = list(JR_v[v])
+    current_berth = None
+    visit_start_time = None
+    visit_end_time = None
+    task_order = 0
+
+    while tasks_remaining:
+        best_choice = None
+
+        for j in tasks_remaining:
+            if j == 'j3' and (v, 'j2') not in TE_vj:
+                continue
+
+            preferred_b = x_vbj_baseline.get((v, j))
+            quantity = n_vj[(v, j)]
+            speed_try = v_j[j]
+            duration_try = quantity / speed_try
+
+            precedence_ready = t_s
+            if j == 'j3' and (v, 'j2') in TE_vj:
+                precedence_ready = max(precedence_ready, TE_vj[(v, 'j2')])
+
+            slot = find_earliest_slot(v, j, duration_try, preferred_b, berth_plan, quay_plan, precedence_ready, current_berth, visit_start_time, visit_end_time)
+            if slot is None:
+                for trial_speed in range(int(v_j[j]), int(vup_j[j]) + 1, 5):
+                    duration_trial = quantity / trial_speed
+                    slot = find_earliest_slot(v, j, duration_trial, preferred_b, berth_plan, quay_plan, precedence_ready, current_berth, visit_start_time, visit_end_time)
+                    if slot:
+                        speed_try = trial_speed
+                        duration_try = duration_trial
+                        break
+
+            if slot is None:
+                continue
+
+            te_cand, ts_cand, b_cand, q_cand = slot
+            if best_choice is None or te_cand < best_choice['te']:
+                best_choice = {'j': j, 'slot': slot, 'speed': speed_try, 'duration': duration_try, 'preferred_b': preferred_b, 'te': te_cand}
+
+        if best_choice is None:
+            raise RuntimeError(f"任务 {v} 未找到可行窗口，请检查数据或参数。")
+
+        j = best_choice['j']
+        ts_candidate, te_candidate, b_sel, q_sel = best_choice['slot'][1], best_choice['slot'][0], best_choice['slot'][2], best_choice['slot'][3]
+        speed = best_choice['speed']
+        preferred_b = best_choice['preferred_b']
+        need_move = current_berth is not None and current_berth != b_sel
+        task_order += 1
+
+        X_vbj[(v, b_sel, j)] = 1
+        if j in JQ and q_sel:
+            Y_vqj[(v, q_sel, j)] = 1
+        TS_vj[(v, j)] = ts_candidate
+        TE_vj[(v, j)] = te_candidate
+        G_vj[(v, j)] = speed
+        Z_vb[(v, b_sel)] = 1
+        S_vb[(v, b_sel)] = min(S_vb[(v, b_sel)], ts_candidate)
+        E_vb[(v, b_sel)] = max(E_vb[(v, b_sel)], te_candidate)
+
+        phi_vbj[(v, b_sel, j)] = 0 if preferred_b == b_sel else 1
+        if j in JQ:
+            preferred_q = y_vqj_baseline.get((v, j))
+            gamma_vqj[(v, q_sel, j)] = 0 if preferred_q == q_sel else 1
+
+        if need_move:
+            O_vbb_prime[(v, current_berth, b_sel)] = 1
+            move_records[v].append((current_berth, b_sel))
+
+        start_idx = int(round((ts_candidate - t_s) / t_ld))
+        end_idx = int(round((te_candidate - t_s) / t_ld))
+        for t_idx in range(start_idx, end_idx):
+            t_val = t_idx
+            SB_vbt[(v, b_sel, t_val)] = 1
+            SBJ_vbjt[(v, b_sel, j, t_val)] = 1
+            if j in JQ and q_sel:
+                SQJ_vqjt[(v, q_sel, j, t_val)] = 1
+
+        berth_plan[b_sel].append((v, task_order, j, ts_candidate, te_candidate))
+        if j in JQ and q_sel:
+            quay_plan[q_sel].append((v, task_order, j, ts_candidate, te_candidate))
+
+        if current_berth == b_sel:
+            if visit_start_time is None:
+                visit_start_time = ts_candidate
+            visit_end_time = max(visit_end_time if visit_end_time is not None else ts_candidate, te_candidate)
+        else:
+            current_berth = b_sel
+            visit_start_time = ts_candidate
+            visit_end_time = te_candidate
+
+        tasks_remaining.remove(j)
+
+    TE_v[v] = max(TE_vj[(v, j)] for j in JR_v[v])
+    D_v[v] = max(0.0, TE_v[v] - t_v_d[v])
+
+# =============================================================================
+# 4.1 线性化变量 α/β/χ/ψ 的推导（基于离散化的占用表）
+# =============================================================================
+
+# 泊位 α、β：在 SB_vbt 的时间轴上，0->1 跳变标记 α=1，1->0 跳变标记 β=1
+berth_time_slots = defaultdict(set)
+for (v, b, t_idx), val in SB_vbt.items():
+    if val == 1:
+        berth_time_slots[(v, b)].add(t_idx)
+
+for (v, b), t_set in berth_time_slots.items():
+    times_sorted = sorted(t_set)
+    for i, t_idx in enumerate(times_sorted):
+        prev_idx = times_sorted[i - 1] if i > 0 else None
+        next_idx = times_sorted[i + 1] if i < len(times_sorted) - 1 else None
+        if prev_idx is None or t_idx != prev_idx + 1:
+            alpha_vbt[(v, b, t_idx)] = 1
+        if next_idx is None or t_idx != next_idx - 1:
+            beta_vbt[(v, b, t_idx)] = 1
+
+# 岸桥 χ、ψ：对每个 (v, q, j) 的 SQJ_vqjt 处理同样的跳变
+quay_time_slots = defaultdict(set)
+for (v, q, j, t_idx), val in SQJ_vqjt.items():
+    if val == 1:
+        quay_time_slots[(v, q, j)].add(t_idx)
+
+for (v, q, j), t_set in quay_time_slots.items():
+    times_sorted = sorted(t_set)
+    for i, t_idx in enumerate(times_sorted):
+        prev_idx = times_sorted[i - 1] if i > 0 else None
+        next_idx = times_sorted[i + 1] if i < len(times_sorted) - 1 else None
+        if prev_idx is None or t_idx != prev_idx + 1:
+            chi_vqjt[(v, q, j, t_idx)] = 1
+        if next_idx is None or t_idx != next_idx - 1:
+            psi_vqjt[(v, q, j, t_idx)] = 1
+
+# =============================================================================
+# 5. 成本计算（对应目标（5）分量 F1~F4）
+# =============================================================================
+
+F1_resource_deviation = 0
+for (v, b, j), val in X_vbj.items():
+    if val == 1:
+        F1_resource_deviation += c_b * phi_vbj[(v, b, j)]
+for (v, q, j), val in Y_vqj.items():
+    if val == 1:
+        F1_resource_deviation += c_q * gamma_vqj.get((v, q, j), 0)
+
+F2_speed_cost = 0
+for (v, j), g in G_vj.items():
+    increment = max(0.0, g - v_j[j])
+    F2_speed_cost += c_j * increment
+
+F3_reberthing_cost = 0
+for v, moves in move_records.items():
+    F3_reberthing_cost += c_s * len(moves)
+
+F4_delay_cost = 0
+for v, delay in D_v.items():
+    F4_delay_cost += c_d * delay
+
+objective_value = alpha1 * F1_resource_deviation + alpha2 * F2_speed_cost + alpha3 * F3_reberthing_cost + alpha4 * F4_delay_cost
+
+# =============================================================================
+# 6. 打印输出：严格对齐示例格式
+# =============================================================================
+
+print("\n================ 结果输出 ================")
+print(f"目标函数值: {objective_value:.2f}")
+print("求解方式: 贪婪启发式 (非精确解)")
+print("\n各目标分量值:")
+print(f"F1 (资源偏离惩罚): {F1_resource_deviation:.2f}")
+print(f"F2 (速率提升成本): {F2_speed_cost:.2f}")
+print(f"F3 (移泊惩罚成本): {F3_reberthing_cost:.2f}")
+print(f"F4 (延迟惩罚成本): {F4_delay_cost:.2f}")
+print(f"验证加权目标值: {objective_value:.2f}")
+print(f"启发式报告目标值: {objective_value:.2f}")
+
+print("\n船舶调度方案:\n")
+
+for v in V_sorted:
+    print(f"船舶 {v}:")
+    print(f"  完成时间: {TE_v[v]:.2f}, 预期离港: {t_v_d[v]}, 延迟: {D_v[v]:.2f}")
+    # 任务按开始时间排序
+    tasks_print = sorted([j for j in JR_v[v]], key=lambda jj: TS_vj[(v, jj)])
+    for j in tasks_print:
+        ts = TS_vj[(v, j)]
+        te = TE_vj[(v, j)]
+        g = G_vj[(v, j)]
+        b_sel = [b for b in B if X_vbj[(v, b, j)] == 1][0]
+        b_base = x_vbj_baseline.get((v, j))
+        b_flag = "符合" if b_base == b_sel else "偏离"
+        print(f"  任务 {j}: 开始={ts:.2f}, 结束={te:.2f}, 速率={g:.2f}")
+        print(f"    泊位: {b_sel} (基线: {b_base if b_base else '无'}) [{b_flag}]")
+        if j in JQ:
+            q_sel_list = [q for q in Q if Y_vqj[(v, q, j)] == 1]
+            q_sel = q_sel_list[0] if q_sel_list else None
+            q_base = y_vqj_baseline.get((v, j))
+            q_flag = "符合" if q_base == q_sel else "偏离"
+            print(f"    岸桥: {q_sel} (基线: {q_base if q_base else '无'}) [{q_flag}]")
+    print("")
+
+print("线性化泊位变量 α/β (按船舶-泊位列出):")
+alpha_beta_keys = set(alpha_vbt.keys()) | set(beta_vbt.keys())
+for key in sorted(set((v, b) for (v, b, _) in alpha_beta_keys)):
+    v, b = key
+    segments = []
+    times = sorted({t for (vv, bb, t) in alpha_vbt if vv == v and bb == b} |
+                   {t for (vv, bb, t) in beta_vbt if vv == v and bb == b})
+    for t_idx in times:
+        t_val = t_s + t_idx * t_ld
+        alpha_flag = alpha_vbt.get((v, b, t_idx), 0)
+        beta_flag = beta_vbt.get((v, b, t_idx), 0)
+        tag = []
+        if alpha_flag:
+            tag.append("α")
+        if beta_flag:
+            tag.append("β")
+        segments.append(f"t={t_val:.2f}({'/'.join(tag)})")
+    if segments:
+        print(f"  {v}-{b}: " + ", ".join(segments))
+if not alpha_vbt:
+    print("  无")
+
+print("\n线性化岸桥变量 χ/ψ (按船舶-岸桥-任务列出):")
+printed_flag = False
+chi_psi_keys = set(chi_vqjt.keys()) | set(psi_vqjt.keys())
+for key in sorted(set((v, q, j) for (v, q, j, _) in chi_psi_keys)):
+    v, q, j = key
+    times = sorted({t for (vv, qq, jj, t) in chi_vqjt if vv == v and qq == q and jj == j} |
+                   {t for (vv, qq, jj, t) in psi_vqjt if vv == v and qq == q and jj == j})
+    segments = []
+    for t_idx in times:
+        t_val = t_s + t_idx * t_ld
+        chi_flag = chi_vqjt.get((v, q, j, t_idx), 0)
+        psi_flag = psi_vqjt.get((v, q, j, t_idx), 0)
+        tag = []
+        if chi_flag:
+            tag.append("χ")
+        if psi_flag:
+            tag.append("ψ")
+        segments.append(f"t={t_val:.2f}({'/'.join(tag)})")
+    if segments:
+        printed_flag = True
+        print(f"  {v}-{q}-{j}: " + ", ".join(segments))
+if not printed_flag:
+    print("  无")
+
+print("移泊情况:")
+for v, moves in move_records.items():
+    for b_from, b_to in moves:
+        print(f"  船舶 {v}: 从泊位 {b_from} 移泊到 {b_to}")
+if all(len(m)==0 for m in move_records.values()):
+    print("  无移泊")
+
+# 泊位视角
+print("\n==================================================")
+print("泊位视角任务执行情况")
+print("==================================================\n")
+for b in B:
+    print(f"泊位 {b}:")
+    print("  船舶       任务       开始时间       结束时间       持续时间      ")
+    print("  -------- -------- ---------- ---------- ----------")
+    for v, order, j, ts, te in sorted(berth_plan[b], key=lambda x: x[3]):
+        duration = te - ts
+        print(f"  {v:<8} {j:<8} {ts:<10.2f} {te:<10.2f} {duration:<10.2f}")
+    print("")
+
+# 岸桥视角
+print("==================================================")
+print("岸桥视角任务执行情况")
+print("==================================================\n")
+for q in Q:
+    print(f"岸桥 {q}:")
+    print("  船舶       任务       泊位       开始时间       结束时间       持续时间      ")
+    print("  -------- -------- -------- ---------- ---------- ----------")
+    for v, order, j, ts, te in sorted(quay_plan[q], key=lambda x: x[3]):
+        b_sel = [b for b in B if X_vbj[(v, b, j)] == 1][0]
+        duration = te - ts
+        print(f"  {v:<8} {j:<8} {b_sel:<8} {ts:<10.2f} {te:<10.2f} {duration:<10.2f}")
+    print("")
