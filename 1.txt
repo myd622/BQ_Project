@@ -1,0 +1,880 @@
+import gurobipy as gp
+from gurobipy import GRB
+import pandas as pd
+import numpy as np
+
+# 创建模型
+model = gp.Model("Berth_QC_Recovery")
+
+# =============================================================================
+# 1. 数据读取和预处理
+# =============================================================================
+
+print("正在读取数据...")
+# 读取Excel文件
+file_path = "D:\SecondSection\Experiment_Data\Data_10.xlsx"
+df = pd.read_excel(file_path, sheet_name="Three Day")
+
+# 基础数据配置
+# 泊位属性配置
+berths = {
+    'b1': ['j1'],
+    'b2': ['j1'],
+    'b3': ['j2', 'j3', 'j5'],
+    'b4': ['j2', 'j3', 'j5', 'j6', 'j7'],
+    'b5': ['j2', 'j3', 'j5', 'j6', 'j7'],
+    'b6': ['j2', 'j3', 'j5', 'j6', 'j7'],
+    'b7': ['j2', 'j3', 'j5', 'j6', 'j7'],
+    'b8': ['j2', 'j3', 'j4'],
+    'b9': ['j2', 'j3', 'j4'],
+}
+
+# 需要岸桥作业的任务集合
+JQ = ['j2', 'j3']
+
+# 与其他任务互斥的任务集合，即不能在同一泊位上执行
+JE = ['j1']
+
+# 任务优先级关系 (p_jj')
+# 这里假设只有j3必须在j2之后执行，其他没有优先级关系
+p_jj_prime = {
+    ('j1', 'j2'): 0, ('j1', 'j3'): 0, ('j1', 'j4'): 0, ('j1', 'j5'): 0, ('j1', 'j6'): 0, ('j1', 'j7'): 0,
+    ('j2', 'j1'): 0, ('j2', 'j3'): 1, ('j2', 'j4'): 0, ('j2', 'j5'): 0, ('j2', 'j6'): 0, ('j2', 'j7'): 0,
+    ('j3', 'j1'): 0, ('j3', 'j2'): 0, ('j3', 'j4'): 0, ('j3', 'j5'): 0, ('j3', 'j6'): 0, ('j3', 'j7'): 0,
+    ('j4', 'j1'): 0, ('j4', 'j2'): 0, ('j4', 'j3'): 0, ('j4', 'j5'): 0, ('j4', 'j6'): 0, ('j4', 'j7'): 0,
+    ('j5', 'j1'): 0, ('j5', 'j2'): 0, ('j5', 'j3'): 0, ('j5', 'j4'): 0, ('j5', 'j6'): 0, ('j5', 'j7'): 0,
+    ('j6', 'j1'): 0, ('j6', 'j2'): 0, ('j6', 'j3'): 0, ('j6', 'j4'): 0, ('j6', 'j5'): 0, ('j6', 'j7'): 0,
+    ('j7', 'j1'): 0, ('j7', 'j2'): 0, ('j7', 'j3'): 0, ('j7', 'j4'): 0, ('j7', 'j5'): 0, ('j7', 'j6'): 0
+}
+
+# 岸桥集合
+Q = ['q1', 'q2', 'q3']
+
+# 移泊时间
+tc_v = 0.5  # 移泊时间（小时）
+
+# 任务j的基线作业速率
+v_j = {
+    'j1': 100,
+    'j2': 20,
+    'j3': 20,
+    'j4': 70,
+    'j5': 45,
+    'j6': 150,
+    'j7': 100,
+}
+
+# 任务j的作业速率上限
+vup_j = {
+    'j1': 150,
+    'j2': 40,
+    'j3': 40,
+    'j4': 160,
+    'j5': 90,
+    'j6': 200,
+    'j7': 150,
+}
+
+# 大M值
+M = 10000
+
+# 时间参数
+t_ld = 1 / 6  # 时刻粒度 (10分钟)
+t_s = 8  # 恢复调度的开始时间
+t_l = 19  # 恢复计划的截止时间
+t_xx = int((t_l - t_s) / t_ld)  # 时间集合大小
+T_set = range(t_xx + 1)  # 时刻集合 T = {0, 1, 2, ..., t_xx}
+
+# 成本参数
+c_b = 1000  # 偏离基线执行泊位的单位惩罚成本
+c_q = 1000  # 偏离基线执行岸桥的单位惩罚成本
+c_j = 1000  # 任务j的单位速率提升的运营成本
+c_d = 10000  # 船舶的单位延迟成本
+c_s = 1000  # 船舶的单次移泊成本
+
+# 目标权重
+alpha1 = 0.4
+alpha2 = 0.2
+alpha3 = 0.2
+alpha4 = 0.2
+
+# =============================================================================
+# 2. 集合定义
+# =============================================================================
+
+# 船舶集合 VR - 需要重新调度的船舶集合
+VR = [f"v{int(row['Vessel No.'])}" for index, row in df.iterrows()]
+
+# 泊位集合 B
+B = list(berths.keys())
+
+# 任务类型集合 J_all
+J_all = ['j1', 'j2', 'j3', 'j4', 'j5', 'j6', 'j7']
+task_mapping = {
+    'Refueling': 'j1',
+    'Unloading': 'j2',
+    'Loading': 'j3',
+    'Charging': 'j4',
+    'Water-filling': 'j5',
+    'Adding ash': 'j6',
+    'Adding mud': 'j7'
+}
+
+# 为每艘船舶构建需要重新调度的任务集合 JR_v
+JR_v = {}
+for index, row in df.iterrows():
+    vessel = f"v{int(row['Vessel No.'])}"
+    JR_v[vessel] = []
+
+    # 检查每个任务类型是否在该船舶上有作业量
+    for task_name, task_id in task_mapping.items():
+        n_col = f"{task_name}_n_vj"
+        if pd.notna(row[n_col]) and row[n_col] > 0:
+            JR_v[vessel].append(task_id)
+
+# 构建包含任务属性j的泊位集合 B_j
+B_j = {}
+for j in J_all:
+    B_j[j] = [b for b in B if j in berths[b]]
+
+# 构建基线计划数据
+x_vbj_baseline = {}  # 船舶v的任务j的基线执行泊位
+y_vqj_baseline = {}  # 船舶v的任务j的基线执行岸桥
+n_vj = {}  # 船舶v的任务j的作业量
+t_v_d = {}  # 船舶v的预期离泊时间
+
+for index, row in df.iterrows():
+    vessel = f"v{int(row['Vessel No.'])}"
+    t_v_d[vessel] = row['Expected departure time']
+
+    for task_name, task_id in task_mapping.items():
+        n_col = f"{task_name}_n_vj"
+        x_col = f"{task_name}_x_vbj"
+        y_col = f"{task_name}_y_vqj"
+
+        if pd.notna(row[n_col]) and row[n_col] > 0:
+            # 作业量
+            n_vj[(vessel, task_id)] = row[n_col]
+
+            # 基线泊位分配
+            if pd.notna(row[x_col]):
+                x_vbj_baseline[(vessel, task_id)] = f"b{int(row[x_col])}"
+
+            # 基线岸桥分配 (只有需要岸桥的任务才有)
+            if task_id in JQ and pd.notna(row[y_col]):
+                y_vqj_baseline[(vessel, task_id)] = f"q{int(row[y_col])}"
+
+# =============================================================================
+# 3. 决策变量定义
+# =============================================================================
+
+print("正在定义决策变量...")
+
+# 3.1 0-1决策变量
+X_vbj = {}  # 若船舶v的任务j分配到泊位b执行，则为1，否则为0
+Y_vqj = {}  # 若船舶v的任务j分配给岸桥q执行，则为1，否则为0
+SB_vbt = {}  # 若在时刻t，泊位b的服务于船舶v，则为1，否则为0
+SBJ_vbjt = {}  # 若在时刻t，泊位b的服务于船舶v的任务j，则为1，否则为0
+SQJ_vqjt = {}  # 若在时刻t，岸桥q的服务于船舶v的任务j，则为1，否则为0
+O_vbb = {}  # 若船舶v在泊位b执行任务之前在泊位b'执行任务，则为1，否则为0
+Z_vb = {}  # 如果船舶v使用泊位b，则为1，否则为0
+varphi_vbj = {}  # 线性化辅助变量
+gamma_vqj = {}  # 线性化辅助变量
+
+# 3.2 连续决策变量
+T_vj_s = {}  # 船舶v的任务j开始时刻
+T_vj_e = {}  # 船舶v的任务j结束时刻
+T_v_e = {}  # 船舶v任务执行的结束时刻
+S_vb = {}  # 船舶v在泊位b的最早时刻
+E_vb = {}  # 船舶v在泊位b的最晚时刻
+G_vj = {}  # 船舶v任务j的作业速率
+D_v = {}  # 船舶v的延迟时间
+
+# 初始化决策变量
+for v in VR:
+    # 船舶结束时刻
+    T_v_e[v] = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name=f"T_{v}_e")
+    # 船舶延迟时间
+    D_v[v] = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name=f"D_{v}")
+
+    for b in B:
+        # 泊位使用指示变量
+        Z_vb[(v, b)] = model.addVar(vtype=GRB.BINARY, name=f"Z_{v}_{b}")
+        # 泊位最早和最晚时刻
+        S_vb[(v, b)] = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name=f"S_{v}_{b}")
+        E_vb[(v, b)] = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name=f"E_{v}_{b}")
+
+        for t in T_set:
+            # 泊位占用指示变量
+            SB_vbt[(v, b, t)] = model.addVar(vtype=GRB.BINARY, name=f"SB_{v}_{b}_{t}")
+
+        for b2 in B:
+            if b != b2:
+                # 移泊指示变量
+                O_vbb[(v, b, b2)] = model.addVar(vtype=GRB.BINARY, name=f"O_{v}_{b}_{b2}")
+
+    for j in JR_v[v]:
+        # 任务开始和结束时刻
+        T_vj_s[(v, j)] = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name=f"T_{v}_{j}_s")
+        T_vj_e[(v, j)] = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name=f"T_{v}_{j}_e")
+        # 任务作业速率
+        G_vj[(v, j)] = model.addVar(lb=v_j[j], ub=vup_j[j], vtype=GRB.CONTINUOUS, name=f"G_{v}_{j}")
+
+        for b in B_j[j]:
+            # 泊位分配变量
+            X_vbj[(v, b, j)] = model.addVar(vtype=GRB.BINARY, name=f"X_{v}_{b}_{j}")
+            # 线性化辅助变量
+            varphi_vbj[(v, b, j)] = model.addVar(vtype=GRB.BINARY, name=f"varphi_{v}_{b}_{j}")
+
+            for t in T_set:
+                # 泊位任务执行指示变量
+                SBJ_vbjt[(v, b, j, t)] = model.addVar(vtype=GRB.BINARY, name=f"SBJ_{v}_{b}_{j}_{t}")
+
+        if j in JQ:
+            for q in Q:
+                # 岸桥分配变量
+                Y_vqj[(v, q, j)] = model.addVar(vtype=GRB.BINARY, name=f"Y_{v}_{q}_{j}")
+                # 线性化辅助变量
+                gamma_vqj[(v, q, j)] = model.addVar(vtype=GRB.BINARY, name=f"gamma_{v}_{q}_{j}")
+
+                for t in T_set:
+                    # 岸桥任务执行指示变量
+                    SQJ_vqjt[(v, q, j, t)] = model.addVar(vtype=GRB.BINARY, name=f"SQJ_{v}_{q}_{j}_{t}")
+
+# =============================================================================
+# 4. 目标函数定义
+# =============================================================================
+
+print("正在定义目标函数...")
+
+# 目标1：最小化资源偏离惩罚成本 (线性化后)
+F1 = gp.quicksum(c_b * varphi_vbj[(v, b, j)]
+                 for v in VR for j in JR_v[v] for b in B_j[j])
+F1 += gp.quicksum(c_q * gamma_vqj[(v, q, j)]
+                  for v in VR for j in JR_v[v] if j in JQ for q in Q)
+
+# 目标2：最小化任务速率提升的额外运营成本
+F2 = gp.quicksum(c_j * (G_vj[(v, j)] - v_j[j])
+                 for v in VR for j in JR_v[v])
+
+# 目标3：最小化船舶移泊惩罚成本
+# F3 = gp.quicksum(c_s * O_vbb[(v, b, b2)]
+#                  for v in VR for b in B for b2 in B if b != b2)
+
+F3 = gp.quicksum(c_s * (gp.quicksum(Z_vb[(v, b)] for b in B) - 1) for v in VR)
+
+# 目标4：最小化船舶延迟惩罚成本 (线性化后)
+F4 = gp.quicksum(c_d * D_v[v] for v in VR)
+
+# 总目标函数：加权求和
+total_objective = alpha1 * F1 + alpha2 * F2 + alpha3 * F3 + alpha4 * F4
+model.setObjective(total_objective, GRB.MINIMIZE)
+
+# =============================================================================
+# 5. 约束条件定义
+# =============================================================================
+
+print("正在添加约束条件...")
+
+# 5.1 任务约束
+
+# 约束(51): 船舶v的任务j仅能在一个泊位上执行
+for v in VR:
+    for j in JR_v[v]:
+        model.addConstr(gp.quicksum(X_vbj[(v, b, j)] for b in B_j[j]) == 1,
+                        name=f"task_assignment_{v}_{j}")
+
+# 约束(52): 船舶v有需要岸桥的任务，则仅有一个岸桥仅能为其提供一次服务
+for v in VR:
+    for j in JR_v[v]:
+        if j in JQ:
+            model.addConstr(gp.quicksum(Y_vqj[(v, q, j)] for q in Q) == 1,
+                            name=f"qc_assignment_{v}_{j}")
+
+# 约束(53): 任务互斥约束
+for v in VR:
+    for b in B:
+        for j in JR_v[v]:
+            if j in JE:
+                for j2 in JR_v[v]:
+                    if j2 != j and j2 in JE:
+                        model.addConstr(X_vbj[(v, b, j)] + X_vbj[(v, b, j2)] <= 1,
+                                        name=f"mutual_exclusion_{v}_{b}_{j}_{j2}")
+
+# 约束(54): 每艘船舶任务优先级约束
+for v in VR:
+    for j in JR_v[v]:
+        for j2 in JR_v[v]:
+            if j != j2 and p_jj_prime.get((j, j2), 0) == 1:
+                model.addConstr(T_vj_s[(v, j2)] >= T_vj_e[(v, j)] - M * (1 - p_jj_prime[(j, j2)]),
+                                name=f"precedence_{v}_{j}_{j2}")
+
+# 5.2 时间约束
+
+# 约束(55): 任务的结束时刻等于其开始时刻加上任务执行时间
+for v in VR:
+    for j in JR_v[v]:
+        model.addConstr(T_vj_e[(v, j)] == T_vj_s[(v, j)] + n_vj[(v, j)] / G_vj[(v, j)],
+                        name=f"task_duration_{v}_{j}")
+
+# 约束(56): 船舶v的结束时刻对应于其所有任务中的最迟完成时刻
+for v in VR:
+    for j in JR_v[v]:
+        model.addConstr(T_v_e[v] >= T_vj_e[(v, j)],
+                        name=f"vessel_end_{v}_{j}")
+
+# 约束(57): 船舶v的结束时刻不晚于恢复计划的截止时间
+for v in VR:
+    model.addConstr(T_v_e[v] <= t_l,
+                    name=f"deadline_{v}")
+
+# 约束(58): 船舶任务开始时间要晚于恢复调度的开始时间
+for v in VR:
+    for j in JR_v[v]:
+        model.addConstr(T_vj_s[(v, j)] >= t_s,
+                        name=f"start_time_{v}_{j}")
+
+# 约束(59)-(60): 船舶的泊位占用时间与船舶任务执行时间对应约束
+for v in VR:
+    for j in JR_v[v]:
+        for b in B_j[j]:
+            # 约束(59): 最早开始时间约束
+            model.addConstr(S_vb[(v, b)] <= T_vj_s[(v, j)] + M * (1 - X_vbj[(v, b, j)]),
+                            name=f"earliest_start_{v}_{b}_{j}")
+            # 约束(60): 最晚结束时间约束
+            model.addConstr(E_vb[(v, b)] >= T_vj_e[(v, j)] - M * (1 - X_vbj[(v, b, j)]),
+                            name=f"latest_end_{v}_{b}_{j}")
+
+'''
+# 约束(61)-(62): 船舶的泊位占用时间与船舶的泊位占用时刻对应约束
+for v in VR:
+    for b in B:
+        for t in T_set:
+            actual_time = t * t_ld + t_s
+            # 约束(61)
+            model.addConstr(S_vb[(v, b)] - actual_time <= M * (1 - SB_vbt[(v, b, t)]),
+                            name=f"berth_start_time_{v}_{b}_{t}")
+            # 约束(62)
+            model.addConstr(E_vb[(v, b)] - actual_time >= -M * (1 - SB_vbt[(v, b, t)]),
+                            name=f"berth_end_time_{v}_{b}_{t}")
+
+# 约束(63)-(66): 船舶任务执行时间与船舶任务执行时刻对应约束
+for v in VR:
+    for j in JR_v[v]:
+        for t in T_set:
+            actual_time = t * t_ld + t_s
+            # 泊位任务执行时刻约束
+            for b in B_j[j]:
+                # 约束(63)
+                model.addConstr(T_vj_s[(v, j)] - actual_time <= M * (1 - SBJ_vbjt[(v, b, j, t)]),
+                                name=f"task_start_berth_{v}_{b}_{j}_{t}")
+                # 约束(64)
+                model.addConstr(T_vj_e[(v, j)] - actual_time >= -M * (1 - SBJ_vbjt[(v, b, j, t)]),
+                                name=f"task_end_berth_{v}_{b}_{j}_{t}")
+
+            # 岸桥任务执行时刻约束 (仅对需要岸桥的任务)
+            if j in JQ:
+                for q in Q:
+                    # 约束(65)
+                    model.addConstr(T_vj_s[(v, j)] - actual_time <= M * (1 - SQJ_vqjt[(v, q, j, t)]),
+                                    name=f"task_start_qc_{v}_{q}_{j}_{t}")
+                    # 约束(66)
+                    model.addConstr(T_vj_e[(v, j)] - actual_time >= -M * (1 - SQJ_vqjt[(v, q, j, t)]),
+                                    name=f"task_end_qc_{v}_{q}_{j}_{t}")
+'''
+#_____________________________________________________
+#新增
+# 引入辅助变量
+alpha_vbt = {}  # 表示 t >= S_vb
+beta_vbt = {}  # 表示 t <= E_vb
+
+for v in VR:
+    for b in B:
+        for t in T_set:
+            actual_time = t * t_ld + t_s
+            # 辅助变量：alpha_vbt = 1 当且仅当 actual_time >= S_vb
+            alpha_vbt[(v, b, t)] = model.addVar(vtype=GRB.BINARY, name=f"alpha_{v}_{b}_{t}")
+            # 辅助变量：beta_vbt = 1 当且仅当 actual_time <= E_vb
+            beta_vbt[(v, b, t)] = model.addVar(vtype=GRB.BINARY, name=f"beta_{v}_{b}_{t}")
+
+            # 约束：alpha_vbt = 1 当且仅当 actual_time >= S_vb
+            model.addConstr(actual_time - S_vb[(v, b)] >= -M * (1 - alpha_vbt[(v, b, t)]),
+                            name=f"alpha_lower_{v}_{b}_{t}")
+            model.addConstr(actual_time - S_vb[(v, b)] <= M * alpha_vbt[(v, b, t)] - 1e-5,
+                            name=f"alpha_upper_{v}_{b}_{t}")
+
+            # 约束：beta_vbt = 1 当且仅当 actual_time <= E_vb
+            model.addConstr(E_vb[(v, b)] - actual_time >= -M * (1 - beta_vbt[(v, b, t)]),
+                            name=f"beta_lower_{v}_{b}_{t}")
+            model.addConstr(E_vb[(v, b)] - actual_time <= M * beta_vbt[(v, b, t)] - 1e-5,
+                            name=f"beta_upper_{v}_{b}_{t}")
+
+            # 关键约束：如果船舶使用泊位b且在占用时间区间内，则SB_vbt必须为1
+            model.addConstr(SB_vbt[(v, b, t)] >= alpha_vbt[(v, b, t)] + beta_vbt[(v, b, t)] + Z_vb[(v, b)] - 2,
+                            name=f"berth_occupation_force_{v}_{b}_{t}")
+
+            # 反向约束：如果SB_vbt=1，则船舶必须使用泊位b
+            model.addConstr(Z_vb[(v, b)] >= SB_vbt[(v, b, t)],
+                            name=f"berth_usage_from_SB_{v}_{b}_{t}")
+            # 反向约束：如果alpha_vbt=1，则船舶必须使用泊位b
+            model.addConstr(alpha_vbt[(v, b, t)] >= SB_vbt[(v, b, t)],
+                            name=f"berth_usage_from_alpha_vbt_{v}_{b}_{t}")
+            # 反向约束：如果beta_vbt，则船舶必须使用泊位b
+            model.addConstr(beta_vbt[(v, b, t)] >= SB_vbt[(v, b, t)],
+                            name=f"berth_usage_from_beta_vbt_{v}_{b}_{t}")
+# 引入辅助变量
+gamma_vqjt = {}  # 表示 t >= T_vj_s
+delta_vqjt = {}  # 表示 t <= T_vj_e
+
+for v in VR:
+    for j in JR_v[v]:
+        if j in JQ:
+            for q in Q:
+                for t in T_set:
+                    actual_time = t * t_ld + t_s
+                    # 辅助变量：gamma_vqjt = 1 当且仅当 actual_time >= T_vj_s
+                    gamma_vqjt[(v, q, j, t)] = model.addVar(vtype=GRB.BINARY, name=f"gamma_{v}_{q}_{j}_{t}")
+                    # 辅助变量：delta_vqjt = 1 当且仅当 actual_time <= T_vj_e
+                    delta_vqjt[(v, q, j, t)] = model.addVar(vtype=GRB.BINARY, name=f"delta_{v}_{q}_{j}_{t}")
+
+                    # 约束：gamma_vqjt = 1 当且仅当 actual_time >= T_vj_s
+                    model.addConstr(actual_time - T_vj_s[(v, j)] >= -M * (1 - gamma_vqjt[(v, q, j, t)]),
+                                    name=f"gamma_lower_{v}_{q}_{j}_{t}")
+                    model.addConstr(actual_time - T_vj_s[(v, j)] <= M * gamma_vqjt[(v, q, j, t)] - 1e-5,
+                                    name=f"gamma_upper_{v}_{q}_{j}_{t}")
+
+                    # 约束：delta_vqjt = 1 当且仅当 actual_time <= T_vj_e
+                    model.addConstr(T_vj_e[(v, j)] - actual_time >= -M * (1 - delta_vqjt[(v, q, j, t)]),
+                                    name=f"delta_lower_{v}_{q}_{j}_{t}")
+                    model.addConstr(T_vj_e[(v, j)] - actual_time <= M * delta_vqjt[(v, q, j, t)] - 1e-5,
+                                    name=f"delta_upper_{v}_{q}_{j}_{t}")
+
+                    # 关键约束：如果岸桥分配给任务且在任务执行时间区间内，则SQJ_vqjt必须为1
+                    model.addConstr(
+                        SQJ_vqjt[(v, q, j, t)] >= gamma_vqjt[(v, q, j, t)] + delta_vqjt[(v, q, j, t)] + Y_vqj[
+                            (v, q, j)] - 2,
+                        name=f"qc_task_occupation_force_{v}_{q}_{j}_{t}")
+
+                    # 反向约束：如果SQJ_vqjt=1，则岸桥必须分配给任务
+                    model.addConstr(Y_vqj[(v, q, j)] >= SQJ_vqjt[(v, q, j, t)],
+                                    name=f"qc_assignment_from_SQJ_{v}_{q}_{j}_{t}")
+
+                    # 反向约束：如果gamma_vqjt，则岸桥必须分配给任务
+                    model.addConstr(gamma_vqjt[(v, q, j, t)] >= SQJ_vqjt[(v, q, j, t)],
+                                    name=f"qc_assignment_from_gamma_vqjt_{v}_{q}_{j}_{t}")
+                    # 反向约束：如果delta_vqjt，则岸桥必须分配给任务
+                    model.addConstr(delta_vqjt[(v, q, j, t)] >= SQJ_vqjt[(v, q, j, t)],
+                                    name=f"qc_assignment_from_gdelta_vqjt_{v}_{q}_{j}_{t}")
+
+#_____________________________________________________
+# 约束(67): 船舶的泊位占用时刻和船舶任务执行时刻对应约束
+for v in VR:
+    for b in B:
+        for j in JR_v[v]:
+            if b in B_j[j]:
+                for t in T_set:
+                    model.addConstr(SBJ_vbjt[(v, b, j, t)] <= SB_vbt[(v, b, t)],
+                                    name=f"berth_task_relation_{v}_{b}_{j}_{t}")
+
+# 5.3 移泊相关约束
+
+# 约束(68)-(69): 移泊时间约束
+for v in VR:
+    for b in B:
+        for b2 in B:
+            if b != b2:
+                # 约束(68)
+                model.addConstr(E_vb[(v, b)] + tc_v <= S_vb[(v, b2)] + M * (1 - O_vbb[(v, b, b2)]),
+                                name=f"transship_time_{v}_{b}_{b2}")
+                # 约束(69) - 重复约束，可能为笔误，这里只添加一次
+                model.addConstr(E_vb[(v, b2)] + tc_v <= S_vb[(v, b)] + M * (1 - O_vbb[(v, b2, b)]),
+                                name=f"transship_time_{v}_{b}_{b2}")
+# 约束(70): 移泊方向唯一性约束
+for v in VR:
+    for b in B:
+        for b2 in B:
+            if b != b2:
+                model.addConstr(O_vbb[(v, b, b2)] + O_vbb[(v, b2, b)] <= 1,
+                                name=f"transship_direction_{v}_{b}_{b2}")
+
+# 约束(71): 移泊与泊位使用关系约束
+for v in VR:
+    for b in B:
+        for b2 in B:
+            if b != b2:
+                model.addConstr(O_vbb[(v, b, b2)] + O_vbb[(v, b2, b)] >=
+                                Z_vb[(v, b)] + Z_vb[(v, b2)] - 1,
+                                name=f"transship_berth_relation_{v}_{b}_{b2}")
+
+# 约束(72)-(73): 移泊变量边界约束
+for v in VR:
+    for b in B:
+        for b2 in B:
+            if b != b2:
+                # 约束(72)
+                model.addConstr(O_vbb[(v, b, b2)] <= Z_vb[(v, b)],
+                                name=f"transship_bound1_{v}_{b}_{b2}")
+                model.addConstr(O_vbb[(v, b, b2)] <= Z_vb[(v, b2)],
+                                name=f"transship_bound1_{v}_{b}_{b2}")
+                # 约束(73)
+                model.addConstr(O_vbb[(v, b2, b)] <= Z_vb[(v, b)],
+                                name=f"transship_bound2_{v}_{b}_{b2}")
+                model.addConstr(O_vbb[(v, b2, b)] <= Z_vb[(v, b2)],
+                                name=f"transship_bound2_{v}_{b}_{b2}")
+
+# 5.4 资源独占约束
+
+# 约束(74): 泊位独占约束 - 每个泊位每个时刻最多被一艘船舶占用
+for b in B:
+    for t in T_set:
+        model.addConstr(gp.quicksum(SB_vbt[(v, b, t)] for v in VR) <= 1,
+                        name=f"berth_exclusive_{b}_{t}")
+
+# 约束(75): 岸桥独占约束 - 每个岸桥每个时刻最多执行一个任务
+for q in Q:
+    for t in T_set:
+        model.addConstr(gp.quicksum(SQJ_vqjt[(v, q, j, t)]
+                                    for v in VR for j in JR_v[v] if j in JQ) <= 1,
+                        name=f"qc_exclusive_{q}_{t}")
+
+# 5.5 变量关联约束
+
+# 约束(76)-(78): 泊位使用与任务分配关联约束
+for v in VR:
+    for b in B:
+        for j in JR_v[v]:
+            if b in B_j[j]:
+                # 约束(76): 如果任务分配到泊位，则船舶使用该泊位
+                model.addConstr(Z_vb[(v, b)] >= X_vbj[(v, b, j)],
+                                name=f"berth_usage1_{v}_{b}_{j}")
+
+        # 约束(77): 如果船舶使用泊位，则至少有一个任务分配到该泊位
+        task_sum = gp.quicksum(X_vbj.get((v, b, j), 0) for j in JR_v[v] if b in B_j.get(j, []))
+        model.addConstr(task_sum <= M * Z_vb[(v, b)],
+                        name=f"berth_usage2_{v}_{b}")
+
+        # 约束(78): 如果船舶使用泊位，则至少有一个任务分配到该泊位
+        model.addConstr(task_sum >= Z_vb[(v, b)],
+                        name=f"berth_usage3_{v}_{b}")
+
+# 约束(79)-(80): 作业速率约束
+for v in VR:
+    for j in JR_v[v]:
+        # 约束(79): 作业速率上限
+        model.addConstr(G_vj[(v, j)] <= vup_j[j],
+                        name=f"rate_upper_{v}_{j}")
+        # 约束(80): 作业速率下限
+        model.addConstr(G_vj[(v, j)] >= v_j[j],
+                        name=f"rate_lower_{v}_{j}")
+
+# 5.6 线性化约束
+
+# 约束(81)-(82): 泊位偏离线性化约束
+for v in VR:
+    for j in JR_v[v]:
+        for b in B_j[j]:
+            baseline_key = (v, j)
+            baseline_value = 1 if baseline_key in x_vbj_baseline and x_vbj_baseline[baseline_key] == b else 0
+
+            # 约束(81)
+            model.addConstr(varphi_vbj[(v, b, j)] >= X_vbj[(v, b, j)] - baseline_value,
+                            name=f"linearization1_{v}_{b}_{j}")
+            # 约束(82)
+            model.addConstr(varphi_vbj[(v, b, j)] >= baseline_value - X_vbj[(v, b, j)],
+                            name=f"linearization2_{v}_{b}_{j}")
+
+# 约束(83)-(84): 岸桥偏离线性化约束
+for v in VR:
+    for j in JR_v[v]:
+        if j in JQ:
+            for q in Q:
+                baseline_key = (v, j)
+                baseline_value = 1 if baseline_key in y_vqj_baseline and y_vqj_baseline[baseline_key] == q else 0
+
+                # 约束(83)
+                model.addConstr(gamma_vqj[(v, q, j)] >= Y_vqj[(v, q, j)] - baseline_value,
+                                name=f"linearization3_{v}_{q}_{j}")
+                # 约束(84)
+                model.addConstr(gamma_vqj[(v, q, j)] >= baseline_value - Y_vqj[(v, q, j)],
+                                name=f"linearization4_{v}_{q}_{j}")
+
+# 约束(85): 延迟时间线性化约束
+for v in VR:
+    model.addConstr(D_v[v] >= T_v_e[v] - t_v_d[v],
+                    name=f"delay_linearization_{v}")
+
+# =============================================================================
+# 6. 模型求解
+# =============================================================================
+
+print("开始求解模型...")
+model.setParam('TimeLimit',  600)  # 设置求解时间限制为1小时
+model.setParam('MIPGap', 0.01)  # 设置MIP间隙为1%
+model.optimize()
+
+# =============================================================================
+# 7. 结果输出
+# =============================================================================
+
+# 7. 结果输出 - 修正版本
+# =============================================================================
+
+print("\n" + "=" * 50)
+print("求解结果")
+print("=" * 50)
+
+if model.status == GRB.OPTIMAL or model.status == GRB.TIME_LIMIT:
+    print(f"求解状态: {model.status}")
+    print(f"目标函数值: {model.objVal:.2f}")
+    print(f"求解时间: {model.Runtime:.2f} 秒")
+
+    # 修正：正确计算各目标分量值
+    F1_value = 0
+    # 计算泊位偏离惩罚
+    for v in VR:
+        for j in JR_v[v]:
+            for b in B_j[j]:
+                if (v, b, j) in varphi_vbj and varphi_vbj[(v, b, j)].X > 0.5:
+                    F1_value += c_b
+
+    # 计算岸桥偏离惩罚
+    for v in VR:
+        for j in JR_v[v]:
+            if j in JQ:
+                for q in Q:
+                    if (v, q, j) in gamma_vqj and gamma_vqj[(v, q, j)].X > 0.5:
+                        F1_value += c_q
+
+    F2_value = sum(c_j * (G_vj[(v, j)].X - v_j[j])
+                   for v in VR for j in JR_v[v] if G_vj[(v, j)].X > v_j[j])
+
+    F3_value = sum(c_s * (sum(Z_vb[(v, b)].X for b in B) - 1) for v in VR )
+
+    F4_value = sum(c_d * D_v[v].X for v in VR)
+
+    print(f"\n各目标分量值:")
+    print(f"F1 (资源偏离惩罚): {F1_value:.2f}")
+    print(f"F2 (速率提升成本): {F2_value:.2f}")
+    print(f"F3 (移泊惩罚成本): {F3_value:.2f}")
+    print(f"F4 (延迟惩罚成本): {F4_value:.2f}")
+
+    # 验证加权目标值
+    weighted_total = alpha1 * F1_value + alpha2 * F2_value + alpha3 * F3_value + alpha4 * F4_value
+    print(f"验证加权目标值: {weighted_total:.2f}")
+    print(f"GUROBI报告目标值: {model.objVal:.2f}")
+
+    # 输出关键决策变量
+    print(f"\n船舶调度方案:")
+    for v in VR:
+        print(f"\n船舶 {v}:")
+        print(f"  完成时间: {T_v_e[v].X:.2f}, 预期离港: {t_v_d[v]}, 延迟: {D_v[v].X:.2f}")
+
+        for j in JR_v[v]:
+            print(f"  任务 {j}: 开始={T_vj_s[(v, j)].X:.2f}, 结束={T_vj_e[(v, j)].X:.2f}, 速率={G_vj[(v, j)].X:.2f}")
+
+            # 输出泊位分配
+            for b in B_j[j]:
+                if X_vbj.get((v, b, j)) and X_vbj[(v, b, j)].X > 0.5:
+                    baseline_b = x_vbj_baseline.get((v, j), "无")
+                    deviation = "偏离" if baseline_b != b else "符合"
+                    print(f"    泊位: {b} (基线: {baseline_b}) [{deviation}]")
+
+            # 输出岸桥分配 (仅对需要岸桥的任务)
+            if j in JQ:
+                for q in Q:
+                    if Y_vqj.get((v, q, j)) and Y_vqj[(v, q, j)].X > 0.5:
+                        baseline_q = y_vqj_baseline.get((v, j), "无")
+                        deviation = "偏离" if baseline_q != q else "符合"
+                        print(f"    岸桥: {q} (基线: {baseline_q}) [{deviation}]")
+
+    # 输出移泊信息
+    print(f"\n移泊情况:")
+    has_transship = False
+    for v in VR:
+        for b in B:
+            for b2 in B:
+                if b != b2 and O_vbb.get((v, b, b2)) and O_vbb[(v, b, b2)].X > 0.5:
+                    print(f"  船舶 {v}: 从泊位 {b} 移泊到 {b2}")
+                    has_transship = True
+    if not has_transship:
+        print("  无移泊操作")
+
+    # =============================================================================
+    # 8. 增加的结果输出：泊位视角和岸桥视角
+    # =============================================================================
+
+    print("\n" + "=" * 50)
+    print("泊位视角任务执行情况")
+    print("=" * 50)
+
+    # 8.1 以泊位为视角，按任务执行开始时间升序输出
+    berth_tasks = {}
+
+    # 收集每个泊位的任务信息
+    for v in VR:
+        for j in JR_v[v]:
+            for b in B_j[j]:
+                if X_vbj.get((v, b, j)) and X_vbj[(v, b, j)].X > 0.5:
+                    if b not in berth_tasks:
+                        berth_tasks[b] = []
+                    berth_tasks[b].append({
+                        'vessel': v,
+                        'task': j,
+                        'start_time': T_vj_s[(v, j)].X,
+                        'end_time': T_vj_e[(v, j)].X,
+                        'duration': T_vj_e[(v, j)].X - T_vj_s[(v, j)].X
+                    })
+
+    # 按泊位排序并输出
+    for b in sorted(berth_tasks.keys()):
+        print(f"\n泊位 {b}:")
+        # 按开始时间升序排序
+        tasks_sorted = sorted(berth_tasks[b], key=lambda x: x['start_time'])
+
+        print(f"  {'船舶':<8} {'任务':<8} {'开始时间':<10} {'结束时间':<10} {'持续时间':<10}")
+        print(f"  {'-' * 8} {'-' * 8} {'-' * 10} {'-' * 10} {'-' * 10}")
+
+        for task_info in tasks_sorted:
+            print(f"  {task_info['vessel']:<8} {task_info['task']:<8} "
+                  f"{task_info['start_time']:<10.2f} {task_info['end_time']:<10.2f} "
+                  f"{task_info['duration']:<10.2f}")
+
+    print("\n" + "=" * 50)
+    print("岸桥视角任务执行情况")
+    print("=" * 50)
+
+    # 8.2 以岸桥为视角，按任务执行开始时间升序输出（仅需要岸桥的任务）
+    qc_tasks = {}
+
+    # 收集每个岸桥的任务信息
+    for v in VR:
+        for j in JR_v[v]:
+            if j in JQ:  # 仅处理需要岸桥的任务
+                for q in Q:
+                    if Y_vqj.get((v, q, j)) and Y_vqj[(v, q, j)].X > 0.5:
+                        if q not in qc_tasks:
+                            qc_tasks[q] = []
+                        qc_tasks[q].append({
+                            'vessel': v,
+                            'task': j,
+                            'start_time': T_vj_s[(v, j)].X,
+                            'end_time': T_vj_e[(v, j)].X,
+                            'duration': T_vj_e[(v, j)].X - T_vj_s[(v, j)].X,
+                            'berth': next(b for b in B_j[j] if X_vbj.get((v, b, j)) and X_vbj[(v, b, j)].X > 0.5)
+                        })
+
+    # 按岸桥排序并输出
+    for q in sorted(qc_tasks.keys()):
+        print(f"\n岸桥 {q}:")
+        # 按开始时间升序排序
+        tasks_sorted = sorted(qc_tasks[q], key=lambda x: x['start_time'])
+
+        print(f"  {'船舶':<8} {'任务':<8} {'泊位':<8} {'开始时间':<10} {'结束时间':<10} {'持续时间':<10}")
+        print(f"  {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 10} {'-' * 10} {'-' * 10}")
+
+        for task_info in tasks_sorted:
+            print(f"  {task_info['vessel']:<8} {task_info['task']:<8} {task_info['berth']:<8} "
+                  f"{task_info['start_time']:<10.2f} {task_info['end_time']:<10.2f} "
+                  f"{task_info['duration']:<10.2f}")
+
+    # 8.3 输出资源利用率统计
+    print("\n" + "=" * 50)
+    print("资源利用率统计")
+    print("=" * 50)
+
+    # 泊位利用率
+    total_berth_time = 0
+    total_available_berth_time = len(B) * (t_l - t_s)
+
+    for b in berth_tasks:
+        berth_usage = sum(task['duration'] for task in berth_tasks[b])
+        total_berth_time += berth_usage
+        utilization = (berth_usage / (t_l - t_s)) * 100
+        print(f"泊位 {b}: 使用时间 = {berth_usage:.2f}小时, 利用率 = {utilization:.2f}%")
+
+    overall_berth_utilization = (total_berth_time / total_available_berth_time) * 100
+    print(f"\n总体泊位利用率: {overall_berth_utilization:.2f}%")
+
+    # 岸桥利用率
+    total_qc_time = 0
+    total_available_qc_time = len(Q) * (t_l - t_s)
+
+    for q in qc_tasks:
+        qc_usage = sum(task['duration'] for task in qc_tasks[q])
+        total_qc_time += qc_usage
+        utilization = (qc_usage / (t_l - t_s)) * 100
+        print(f"岸桥 {q}: 使用时间 = {qc_usage:.2f}小时, 利用率 = {utilization:.2f}%")
+
+    overall_qc_utilization = (total_qc_time / total_available_qc_time) * 100
+    print(f"\n总体岸桥利用率: {overall_qc_utilization:.2f}%")
+
+    print("\n" + "=" * 50)
+    print("输出完成")
+    print("=" * 50)
+
+    # 输出移泊信息
+    print(f"\n移泊情况:")
+    has_transship = False
+    for v in VR:
+        for b in B:
+            for b2 in B:
+                if b != b2 and O_vbb.get((v, b, b2)) and O_vbb[(v, b, b2)].X > 0.5:
+                    print(f"  船舶 {v}: 从泊位 {b} 移泊到 {b2}")
+                    has_transship = True
+    if not has_transship:
+        print("  无移泊操作")
+
+    # =============================================================================
+    # 新增：输出所有O_vbb'决策变量值
+    # =============================================================================
+
+    print("\n" + "=" * 80)
+    print("所有O_vbb'决策变量值")
+    print("=" * 80)
+
+    # 按船舶分组输出
+    for v in sorted(VR):
+        print(f"\n船舶 {v}:")
+        header_printed = False
+
+        for b in sorted(B):
+            for b2 in sorted(B):
+                if b != b2 and (v, b, b2) in O_vbb:
+                    if not header_printed:
+                        print(f"  {'源泊位':<6} {'目标泊位':<6} {'变量值':<8} {'是否移泊':<8}")
+                        print(f"  {'-' * 6} {'-' * 6} {'-' * 8} {'-' * 8}")
+                        header_printed = True
+
+                    var_value = O_vbb[(v, b, b2)].X
+                    is_active = "是" if var_value > 0.5 else "否"
+                    print(f"  {b:<6} {b2:<6} {var_value:<8.2f} {is_active:<8}")
+
+        if not header_printed:
+            print("  无移泊决策变量")
+
+    # 统计信息
+    total_vars = sum(1 for v in VR for b in B for b2 in B if b != b2 and (v, b, b2) in O_vbb)
+    active_vars = sum(1 for v in VR for b in B for b2 in B
+                      if b != b2 and (v, b, b2) in O_vbb and O_vbb[(v, b, b2)].X > 0.5)
+
+    print(f"\n统计信息:")
+    print(f"  总移泊决策变量数: {total_vars}")
+    print(f"  激活的移泊变量数: {active_vars}")
+    print(f"  移泊变量激活率: {active_vars / total_vars * 100:.2f}%")
+
+    # =============================================================================
+    # 8. 增加的结果输出：泊位视角和岸桥视角
+    # =============================================================================
+
+    print("\n" + "=" * 50)
+    print("泊位视角任务执行情况")
+    print("=" * 50)
+
+
+else:
+    print("模型未找到可行解或求解失败")
+    print(f"求解状态: {model.status}")
+
+print("\n" + "=" * 50)
+print("求解完成")
+print("=" * 50)
